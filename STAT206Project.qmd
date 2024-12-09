@@ -1,0 +1,280 @@
+---
+title: "Outage Driver - Regression Analysis Approach"
+author: "Ying Li"
+date: "2024-11-10"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("globals")
+library(MASS)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(stargazer)
+library(broom)
+library(randomForest)
+library(caret)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+```
+
+## Data Management Process
+
+1.  Remove rows with NA values (for outage duration and scores) and keep only "Maintenance-Schedule" data
+
+2.  Trim the data to keep only possible that will used towards the analysis.
+
+3.  Create a several binary variables from the existing fields, such as:
+
+-   for "Crew type", `Contractor` is 1 and any all the other crew types are 0.
+-   outages in 90 days - 1 or more than 1 outages in 90 days.
+-   Weekday - weekend vs. weekday.
+-   notifications status - sent or not
+-   convert minutes to hours to be able to interpret coefficients sensibly.
+-   etc, see Appendix for more code snippets
+
+4.  Remove outages that lasted more than 50 hours (only 113 observation from the subset) - basically extreme outlines.
+
+5.  Remove the 'Neutrals' (indifferent folks) and focus on `Promoters` and `Detractors`.
+
+-   Dependent variable is for each observation/row is binary
+
+6.  Perform Logistic regression
+
+-   start with simple logistic regression with single variable - outage duration/hour
+-   perform multiple variable logistic regression to check if outage duration coefficients loses its statistical significance.
+-   using variables used in the logistic regression perform feature random forest model and visualize the feature importance list.
+
+Logistic regression provides direct interpretability of feature effects through coefficients, while Random Forests distribute the importance across many trees.
+
+The variable importance plot informs us about how much each $x$ variable contributes to predicting $y$. It does not tell us about how they do so. Specifically, it does not tell us about the direction and shape of association with $y$.
+
+```{r echo=FALSE}
+# Read in the raw data from VOC_OMS_2023.csv
+VOC_OMS_2023 <- read_csv("VOC_OMS_2023.csv")
+df <- VOC_OMS_2023
+
+# Convert Duration from minutes to hours
+df$Day_Duration_hour <- df$Day_Duration_Min/60
+
+num_negatives <- sum(df$Day_Duration_Min < 0, na.rm = TRUE)
+num_non_negatives <- sum(df$Day_Duration_Min >= 0, na.rm = TRUE)
+num_NAs <- sum(is.na(df$Day_Duration_Min))
+
+# Remove rows with NA values and keep only "Maintenance-Schedule" observation
+df_clean <- df[df$sce_eventsub_category_alt == 'Maintenance - Schedule', ]
+df_final <- df_clean[!is.na(df_clean$sce_raw_score_field_int) & !is.na(df_clean$Day_Duration_hour), ]
+
+# Create a subset of the data where Day_Duration_hour is less than or equal to 50
+subset_df <- df_final[df_final$Day_Duration_hour <= 50, ]
+
+# Count the number of values greater than 50
+num_greater_than_50 <- sum(df_final$Day_Duration_hour > 50)
+
+# Print the number of values greater than 50
+cat("Number of values greater than 50:", num_greater_than_50, "\n")
+
+# Calculate the mean and median of the subset data
+mean_val <- mean(subset_df$Day_Duration_hour)
+median_val <- median(subset_df$Day_Duration_hour)
+
+par(mar = c(4, 4, 2, 2))
+# Plot the histogram
+hist(subset_df$Day_Duration_hour, main="Distribution of Outage Duration (<= 50 hours)", xlab="Outage Duration (hours)", xlim=c(0, 50))
+
+# Add lines for the mean and median
+abline(v = mean_val, col = "blue", lwd = 2, lty = 2)  # Mean line
+abline(v = median_val, col = "red", lwd = 2, lty = 2) # Median line
+
+# Add a legend to the plot
+legend("topright", legend = c(paste("Mean =", round(mean_val, 2)), paste("Median =", round(median_val, 2))), col = c("blue", "red"), lty = 2, lwd = 2)
+```
+
+## Logistic Regression:
+
+I start the analysis with one independent variable to monitor if the outage duration has any impact. I will continue adding more variables to check if more explanatory variables results in more meaningful results. We are closely analyzing the scheduled maintenance outages.
+
+$$ logit(P(Y=1))=\beta_0+\beta_{1}*OutageDuration(hour) $$
+
+Now, remove the `Neutrals` from the data and generate a new binary variable where 'Detractors' is 0, and 'Promoters\` are 1. Focus the attention on being *promoter vs. detractor*. Then, initiate the logistic regression series - basically given the characteristics how much (probability, how likely) someone will be detractors or promoters.
+
+```{r warning=FALSE, echo=FALSE}
+# Recode the values in sce_raw_score_field_int to create a binary dependent variable 'score'
+df_final$score <- ifelse(df_final$sce_raw_score_field_int %in% 1:6, 0, 
+                     ifelse(df_final$sce_raw_score_field_int %in% 9:10, 1, NA))                   
+# Filter the data to keep only rows with recoded_score values of 0 and 1
+df_binary <- df_final[!is.na(df_final$score) & df_final$score %in% c(0, 1), ]
+
+logit_model_hour <- glm(score ~ Day_Duration_hour, data = df_binary, family = binomial)
+
+stargazer(logit_model_hour, type = "text", 
+          star.cutoffs = c(0.05, 0.01, 0.001), 
+          single.row = TRUE, 
+          no.space = TRUE,
+          rownames = FALSE,
+          out.header = FALSE)
+
+
+
+exp(coef(logit_model_hour)["Day_Duration_hour"])
+```
+
+The coefficient $\beta_1$ can be exponentiation to get the odds ratio: $$ OddsRatio=e^{\beta_{1}}$$
+
+Then, the *Maintenance (Scheduled) outages'* odds ratio for `Outage Duration (in Hour)` is 0.8337649.
+
+This means *for each additional hour of scheduled maintenance outages, the odds of achieving a high satisfaction score (9 or 10) decrease by approximately 16.6%.* The results are statistically significant.
+
+I performed the similar exercise for all outage types where odds ratio is 0.9430604, basically the odds of achieving a high satisfaction score (9 or 10) decrease by approximately 5.69%. Thus, impact of duration is reduced if we assemble all outage types.
+
+I also performed linear regression as a first pass (which is not ideal where dependent variable is not continues) to check the statistical significance.
+
+### Below analysis is based on the multivariable logistic regression, where I added several other variables to the analysis.
+
+The odds of being *promoter* is about 9.4% lower for each additional hour of **outage duration** (For $n$ additional hours, the new odds ratio can be calculated as $OR_n = OR^n$, percentage change = $(1 - OR^n) * 100 )$.
+
+The log odds of being *promoter* decrease by 0.158 when the crew type is a contractor compared to when it’s not, holding all other variables constant. This corresponds to the odds of being happy are about 0.854 times (or 14.6% lower) when the **crew type is a contractor**.
+
+The odds of being *promoter* are about 0.779 times lower for customers who experienced more than one outage in the last 90 days, compared to those who experienced one or no outages. In other words, these customers are about 22.1% less likely to be *promoter*.
+
+Including quarter as a factor in the logistic regression model can help control for seasonal effects. Interactions between outage duration and season provide additional insights which is how the relationship between outage duration and satisfaction changes across different months and quarters.
+
+The interaction between outage duration and quarter indicates that longer outages have a more negative impact on satisfaction (being detractor vs promoter) in the second, third, and fourth quarters compared to the first quarter. The effect is strongest in the *fourth quarter*. The odds ratio of 0.961 means that the odds of being satisfied decrease by approximately 3.9% for each additional hour of outage in the fourth quarter.
+
+The maintenance outages in the second or fourth quarter positively impacts the likelihood of being *promoter* compared to the first quarter, while the third quarter shows no significant difference. For instance, the odds of being *promoter* are approximately 22.9% higher in the second quarter compared to the first quarter.
+
+```{r warning=FALSE, echo=FALSE}
+#Further data cleaning and data management
+
+# for Crew type, `Contractor` is 1 nd any other crew type is 0.
+# created a binary variable for ease of using in the regressions.
+df_binary$CREW_TYPE <- ifelse(df_binary$CREW_TYPE == 'CONTRACTOR', 1, 
+                       ifelse(is.na(df_binary$CREW_TYPE), NA, 0))
+
+df_binary$PAPERLESS_BILLING_FLAG <- ifelse(df_binary$PAPERLESS_BILLING_FLAG == 'X', 1, 0)
+
+#NEM status
+df_binary$NEMstatus <- ifelse(df_binary$NEMstatus == 'ERT-NEM', 1, 0)
+
+# basically if someone experiences only 1 or more than 1 outages in 90 days.
+df_binary$TOTAL_OUTAGES_IN_90DAYS <- ifelse(df_binary$TOTAL_OUTAGES_IN_90DAYS == 1, 0, 1)
+
+df_binary$NOTIFICATION_STATUS <- ifelse(df_binary$NOTIFICATION_STATUS == 'S', 1, 0)
+
+df_binary$Total_Success_Notification[is.na(df_binary$Total_Success_Notification)] <- 0
+
+df_binary$is_weekday <- ifelse(df_binary$Weekday %in% c(6, 7), 0, 1)
+
+df_binary$event_date <- as.Date(df_binary$sce_eventstartdate_date, format = "%m/%d/%Y")
+
+library(lubridate)
+df_binary$month <- month(df_binary$event_date)
+df_binary$quarter <- quarter(df_binary$event_date)
+
+df_binary$month <- as.factor(df_binary$month)
+df_binary$quarter <- as.factor(df_binary$quarter)
+
+# Set the number of digits to display
+options(digits = 4)
+
+# Run your model
+logit_model_multi <- glm(formula = score ~ Day_Duration_hour + CREW_TYPE + PAPERLESS_BILLING_FLAG + 
+    NEMstatus + TOTAL_OUTAGES_IN_90DAYS + NOTIFICATION_STATUS + 
+    Total_Success_Notification + is_weekday + is_weekday * Day_Duration_hour + StartT_Daytime_Night + RestoreT_Daytime_Night + StartT_PeakHour_orNot + 
+    RestoreT_PeakHour_orNot + quarter  + Day_Duration_hour * quarter, family = binomial, data = df_binary)
+
+coef_df <- tidy(logit_model_multi)
+coef_df$odds_ratio <- exp(coef_df$estimate)
+
+# Create custom summary table
+summary_table <- data.frame(
+  Term = coef_df$term,
+  Coefficient = coef_df$estimate,
+  Odds_Ratio = coef_df$odds_ratio,
+  Std_Error = coef_df$std.error,
+  z_value = coef_df$statistic,
+  p_value = coef_df$p.value
+)
+
+# Function to format the table with stargazer
+stargazer_custom <- function(summary_table) {
+  stargazer(summary_table,
+            type = "text",
+            summary = FALSE,
+            rownames = FALSE,
+            title = "Logistic Regression Results with Odds Ratios",
+            column.sep.width = "2pt",
+            out.header = FALSE,
+            single.row = TRUE)
+}
+
+# Display the custom table
+stargazer_custom(summary_table)
+
+# Calculate odds ratios
+#or <- exp(coef(logit_model_multi))
+# Get summary and add odds ratios to summary
+#summary_obj <- summary(logit_model_multi)
+#summary_obj$coefficients <- cbind(summary_obj$coefficients, "Odds Ratio" = or)
+
+
+#print(summary_obj)
+
+
+```
+
+## Next, we can perform Random Forest Feature Importance which show the relative importance of each feature in making predictions.
+
+Features with higher importance values contribute more to the model’s predictive accuracy. Unlike logistic regression, feature importance from a random forest does not give you information about the direction of the relationship (i.e., whether the relationship is positive or negative).
+
+```{r warning=FALSE, echo=FALSE}
+
+# Load the package
+library(randomForest)
+
+# Convert 'score' to a factor if it's not already
+df_binary$score <- as.factor(df_binary$score)
+
+# Fit the random forest model
+rf_model <- randomForest(score ~ Day_Duration_hour + CREW_TYPE + 
+    PAPERLESS_BILLING_FLAG +
+    NEMstatus + TOTAL_OUTAGES_IN_90DAYS + NOTIFICATION_STATUS +
+    Total_Success_Notification + is_weekday + is_weekday * Day_Duration_hour +
+    StartT_Daytime_Night + RestoreT_Daytime_Night + StartT_PeakHour_orNot +
+    RestoreT_PeakHour_orNot + quarter  + Day_Duration_hour * quarter, 
+    data = df_binary, na.action=na.exclude)
+
+# Print the model summary
+# print(rf_model)
+
+# Plot the feature importance
+# importance(rf_model)
+varImpPlot(rf_model)
+
+var <- "Day_Duration_hour"
+
+# Perform Partial Dependence Plot (PDP)
+# pdp_data <- partialPlot(rf_model, df_binary, var, plot = FALSE)
+
+# Convert to data frame for ggplot2
+# pdp_df <- data.frame(Day_Duration_hour= pdp_data$x, score = pdp_data$y)
+
+# Plot PDP with ggplot2
+# ggplot(pdp_df, aes(x = Day_Duration_hour, y = score)) +
+#  geom_line() +
+#  labs(title = "Partial Dependence Plot for Outage Duration",
+#       x = "Outage Duration (by Hour)",
+#      y = "Satisfaction Score") +
+#  theme_minimal()
+
+```
+
+To combine these insights, we can look for features that are both statistically significant in the logistic regression model and have high importance in the random forest model. These are likely to be particularly important predictors of your outcome. As it shown in the figure the several of the variables that we statistically significant to predict the higher satisfaction (being promoter) are also important in contributing more to the model’s predictive accuracy. *Outage Duration* is one of the most critical one.
+
+\pagebreak
+
+### 
